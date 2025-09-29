@@ -21,7 +21,7 @@
     
     // Helper to check if libsodium is available
     function hasLibSodium() {
-      return typeof window.sodium !== 'undefined';
+      return typeof adoptSodiumGlobal() !== 'undefined';
     }
 
     // Generate or load user keypair
@@ -1060,24 +1060,58 @@
       'https://unpkg.com/libsodium-wrappers@0.7.15/dist/modules/libsodium-wrappers.js'
     ];
 
+    function toAbsoluteUrl(candidate) {
+      try {
+        return new URL(candidate, window.location.href).toString();
+      } catch (e) {
+        return candidate;
+      }
+    }
+
+    function adoptSodiumGlobal() {
+      if (typeof window.sodium !== 'undefined') {
+        return window.sodium;
+      }
+      if (typeof window._sodium !== 'undefined') {
+        window.sodium = window._sodium;
+        return window.sodium;
+      }
+      if (typeof window.Module !== 'undefined' && typeof window.Module.ready !== 'undefined') {
+        window.sodium = window.Module;
+        return window.sodium;
+      }
+      return undefined;
+    }
+
     function loadScriptOnce(src, timeoutMs = 10000) {
       return new Promise((resolve, reject) => {
         const s = document.createElement('script');
         let done = false;
         const timer = setTimeout(() => {
           if (done) return;
-          done = true; try { s.remove(); } catch {}
+          done = true;
+          try { s.remove(); } catch {}
           reject(new Error('Timeout chargement script'));
         }, timeoutMs);
         s.src = src;
         s.async = true;
         s.onload = async () => {
-          if (done) return; done = true; clearTimeout(timer);
-          try { if (window.sodium && window.sodium.ready) { await window.sodium.ready; } } catch {}
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          try {
+            const sodium = adoptSodiumGlobal();
+            if (sodium?.ready) {
+              await sodium.ready;
+            }
+          } catch {}
           resolve(true);
         };
         s.onerror = () => {
-          if (done) return; done = true; clearTimeout(timer);
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          try { s.remove(); } catch {}
           reject(new Error('Erreur chargement script'));
         };
         document.head.appendChild(s);
@@ -1089,10 +1123,27 @@
       async function tryUmd(urls, source) {
         for (const url of urls) {
           try {
-            log(`Chargement libsodium (${source} UMD) → ${url}`);
-            await loadScriptOnce(url, 12000);
-            if (window.sodium) {
-              await window.sodium.ready;
+            const absoluteUrl = toAbsoluteUrl(url);
+            if (source === 'local') {
+              try {
+                const probe = await fetch(absoluteUrl, { method: 'HEAD', cache: 'no-cache' });
+                if (!probe.ok) {
+                  log(`libsodium introuvable en local (${probe.status}) → ${absoluteUrl}`, 'err');
+                  tried.push(`${absoluteUrl} (HEAD ${probe.status})`);
+                  continue;
+                }
+              } catch (probeError) {
+                log(`Erreur HEAD vers ${absoluteUrl}: ${probeError.message || probeError}`, 'err');
+                tried.push(`${absoluteUrl} (HEAD ${probeError.message || probeError})`);
+                continue;
+              }
+            }
+            log(`Chargement libsodium (${source} UMD) → ${absoluteUrl}`);
+            await loadScriptOnce(absoluteUrl, 12000);
+            const sodium = adoptSodiumGlobal();
+            if (sodium) {
+              if (sodium.ready) { await sodium.ready; }
+              window.sodium = sodium;
               log(`✅ libsodium chargé (${source} UMD)`, 'ok');
               return true;
             }
@@ -1107,9 +1158,24 @@
       async function tryEsm(urls, source) {
         for (const url of urls) {
           try {
-            log(`Chargement libsodium (${source} ESM) → ${url}`);
-            const mod = await import(/* @vite-ignore */ url);
-            const sodium = mod?.default || mod;
+            const absoluteUrl = toAbsoluteUrl(url);
+            if (source === 'local') {
+              try {
+                const probe = await fetch(absoluteUrl, { method: 'HEAD', cache: 'no-cache' });
+                if (!probe.ok) {
+                  log(`libsodium introuvable en local (${probe.status}) → ${absoluteUrl}`, 'err');
+                  tried.push(`${absoluteUrl} (HEAD ${probe.status})`);
+                  continue;
+                }
+              } catch (probeError) {
+                log(`Erreur HEAD vers ${absoluteUrl}: ${probeError.message || probeError}`, 'err');
+                tried.push(`${absoluteUrl} (HEAD ${probeError.message || probeError})`);
+                continue;
+              }
+            }
+            log(`Chargement libsodium (${source} ESM) → ${absoluteUrl}`);
+            const mod = await import(/* @vite-ignore */ absoluteUrl);
+            const sodium = mod?.default || mod || adoptSodiumGlobal();
             if (sodium) {
               if (sodium.ready) { await sodium.ready; }
               window.sodium = sodium;
