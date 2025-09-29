@@ -1,0 +1,1526 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Test Upload (dossier, chunks) → Symfony → GitLab</title>
+  <link rel="stylesheet" href="./styles.css" />
+  <script>
+    const $ = sel => document.querySelector(sel);
+    const log = (msg, cls='') => {
+      const el = document.createElement('div');
+      el.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      if (cls) el.className = cls;
+      $('#log').appendChild(el);
+      $('#log').scrollTop = $('#log').scrollHeight;
+    };
+
+    // ========== E2EE State Management ==========
+    let userKeys = null; // { keyId, publicKey, privateKey, kdfSalt, kdfParams, algorithm }
+    let projectKeys = null; // { pkId, projectKey (Uint8Array), recipients }
+    
+    // Helper to check if libsodium is available
+    function hasLibSodium() {
+      return typeof window.sodium !== 'undefined';
+    }
+
+    // Generate or load user keypair
+    async function ensureUserKeys() {
+      if (userKeys) return userKeys;
+      
+      if (!hasLibSodium()) {
+        await loadSodiumWithFallbacks();
+      }
+      
+      await window.sodium.ready;
+      
+      // Try to load from localStorage first
+      try {
+        const saved = localStorage.getItem('e2ee_userKeys');
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          // Ask for password to decrypt private key
+          const password = prompt('Mot de passe pour déchiffrer votre clé privée :');
+          if (!password) throw new Error('Mot de passe requis');
+          
+          const salt = window.sodium.from_base64(parsed.kdfSalt);
+          const key = await deriveKey(password, salt);
+          const encPriv = window.sodium.from_base64(parsed.encryptedPrivateKey);
+          const privateKey = window.sodium.crypto_secretbox_open_easy(encPriv, window.sodium.from_hex('000102030405060708090a0b0c0d0e0f101112131415161718191a1b'), key);
+          
+          userKeys = {
+            keyId: parsed.keyId,
+            publicKey: window.sodium.from_base64(parsed.publicKey),
+            privateKey: privateKey,
+            kdfSalt: parsed.kdfSalt,
+            kdfParams: parsed.kdfParams,
+            algorithm: parsed.algorithm
+          };
+          
+          log('Clés utilisateur chargées depuis le stockage local', 'ok');
+          return userKeys;
+        }
+      } catch (e) {
+        log(`Erreur chargement clés: ${e.message}`, 'err');
+      }
+      
+      // Generate new keypair
+      const password = prompt('Créer un nouveau mot de passe pour chiffrer votre clé privée :');
+      if (!password) throw new Error('Mot de passe requis');
+      
+      const keyPair = window.sodium.crypto_box_keypair();
+      const salt = window.sodium.randombytes_buf(32);
+      const derivedKey = await deriveKey(password, salt);
+      const nonce = window.sodium.from_hex('000102030405060708090a0b0c0d0e0f101112131415161718191a1b');
+      const encryptedPrivateKey = window.sodium.crypto_secretbox_easy(keyPair.privateKey, nonce, derivedKey);
+      
+      const keyId = `kp-${new Date().getFullYear()}-${(new Date().getMonth()+1).toString().padStart(2,'0')}`;
+      const kdfParams = { algorithm: 'argon2id', m: 65536, t: 3, p: 1 };
+      
+      userKeys = {
+        keyId,
+        publicKey: keyPair.publicKey,
+        privateKey: keyPair.privateKey,
+        kdfSalt: window.sodium.to_base64(salt),
+        kdfParams,
+        algorithm: 'x25519+sealedbox'
+      };
+      
+      // Save to localStorage
+      const toSave = {
+        keyId,
+        publicKey: window.sodium.to_base64(keyPair.publicKey),
+        encryptedPrivateKey: window.sodium.to_base64(encryptedPrivateKey),
+        kdfSalt: userKeys.kdfSalt,
+        kdfParams,
+        algorithm: userKeys.algorithm
+      };
+      localStorage.setItem('e2ee_userKeys', JSON.stringify(toSave));
+      
+      // Register with server
+      await registerUserKeys();
+      
+      log('Nouvelles clés utilisateur générées et sauvegardées', 'ok');
+      return userKeys;
+    }
+
+    async function deriveKey(password, salt) {
+      await window.sodium.ready;
+      return window.sodium.crypto_pwhash(32, password, salt, 3, 65536, window.sodium.crypto_pwhash_ALG_ARGON2ID);
+    }
+
+    async function registerUserKeys() {
+      const base = ($('#base').value || '').replace(/\/$/, '');
+      const token = $('#token').value.trim();
+      if (!token || !userKeys) return;
+      
+      const payload = {
+        keyId: userKeys.keyId,
+        publicKey: userKeys.kdfSalt, // We store kdfSalt in publicKey field for this POC
+        encryptedPrivateKey: window.sodium.to_base64(window.sodium.crypto_secretbox_easy(
+          userKeys.privateKey, 
+          window.sodium.from_hex('000102030405060708090a0b0c0d0e0f101112131415161718191a1b'),
+          await deriveKey('default', window.sodium.from_base64(userKeys.kdfSalt))
+        )),
+        kdfSalt: userKeys.kdfSalt,
+        kdfParams: userKeys.kdfParams,
+        algorithm: userKeys.algorithm
+      };
+
+      // Fix: actually store the public key
+      payload.publicKey = window.sodium.to_base64(userKeys.publicKey);
+      
+      try {
+        const res = await fetch(`${base}/api/v1/user/keys/register`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify(payload)
+        });
+        
+        if (!res.ok) {
+          const err = await res.text();
+          log(`Erreur enregistrement clés: ${err}`, 'err');
+          return;
+        }
+        
+        log('Clés utilisateur enregistrées sur le serveur', 'ok');
+      } catch (e) {
+        log(`Exception enregistrement clés: ${e.message}`, 'err');
+      }
+    }
+
+    // Generate project key for E2EE project
+    async function generateProjectKey() {
+      if (!hasLibSodium()) throw new Error('libsodium requis');
+      await window.sodium.ready;
+      
+      const projectKey = window.sodium.randombytes_buf(32); // 256-bit key for XChaCha20-Poly1305
+      const pkId = `pk-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`;
+      
+      return { projectKey, pkId };
+    }
+
+    // Wrap project key for a recipient
+    async function wrapProjectKeyForRecipient(projectKey, recipientPubKey) {
+      await window.sodium.ready;
+      const wrapped = window.sodium.crypto_box_seal(projectKey, recipientPubKey);
+      return window.sodium.to_base64(wrapped);
+    }
+
+    // Unwrap project key (for ourselves)
+    async function unwrapProjectKey(wrappedPK) {
+      if (!userKeys) await ensureUserKeys();
+      await window.sodium.ready;
+      
+      const wrapped = window.sodium.from_base64(wrappedPK);
+      const projectKey = window.sodium.crypto_box_seal_open(wrapped, userKeys.publicKey, userKeys.privateKey);
+      return projectKey;
+    }
+
+    // Encrypt file for E2EE
+    async function encryptFile(file, projectKey) {
+      if (!hasLibSodium()) throw new Error('libsodium requis');
+      await window.sodium.ready;
+      
+      const fileKey = window.sodium.randombytes_buf(32);
+      const nonce = window.sodium.randombytes_buf(24); // XChaCha20-Poly1305 nonce
+      
+      // Read file data
+      const fileData = new Uint8Array(await file.arrayBuffer());
+      
+      // Encrypt file data with file key
+      const encrypted = window.sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
+        fileData, null, null, nonce, fileKey
+      );
+      
+      // Wrap file key with project key
+      const wrappedFileKey = window.sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
+        fileKey, null, null, window.sodium.randombytes_buf(24), projectKey
+      );
+      
+      return {
+        cipher: encrypted,
+        header: {
+          algorithm: 'xchacha20poly1305',
+          nonce: window.sodium.to_base64(nonce),
+          aad: null
+        },
+        key: {
+          algorithm: 'xchacha20poly1305+pk',
+          wrappedKey: window.sodium.to_base64(wrappedFileKey),
+          pkRef: projectKeys?.pkId || 'unknown'
+        }
+      };
+    }
+
+    // Load project keys from server
+    async function loadProjectKeys(projectId) {
+      const base = ($('#base').value || '').replace(/\/$/, '');
+      const token = $('#token').value.trim();
+      if (!token) return null;
+      
+      try {
+        // Get project repository info first
+        const projectRes = await fetch(`${base}/api/v1/projects/${projectId}`, {
+          headers: { 'Authorization': `Bearer ${token}` }
+        });
+        
+        if (!projectRes.ok) return null;
+        
+        const projectData = await projectRes.json();
+        const repoId = projectData.project?.gitlab_project_id;
+        if (!repoId) return null;
+        
+        // Try to fetch project.keys.json from Gitea via the API
+        // Note: This is a simplified approach - in practice you'd use Gitea API
+        log(`Projet E2EE détecté (repo ${repoId}) - Chargement des clés...`);
+        
+        // For now, return null to indicate no E2EE keys (fallback to plain upload)
+        return null;
+      } catch (e) {
+        log(`Erreur chargement clés projet: ${e.message}`, 'err');
+        return null;
+      }
+    }
+
+    // Progress helpers (0-100%)
+    function setPercent(current, total) {
+      const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+      const bar = $('#progressPct');
+      const txt = $('#pctText');
+      if (bar) bar.value = Math.min(100, Math.max(0, pct));
+      if (txt) txt.textContent = `${Math.min(100, Math.max(0, pct))}%`;
+    }
+
+    // Crypto helpers
+    async function sha256HexOfFile(file) {
+      try {
+        const buf = await file.arrayBuffer();
+        const digest = await crypto.subtle.digest('SHA-256', buf);
+        const hex = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('');
+        return hex;
+      } catch (e) {
+        log(`Impossible de calculer SHA-256 local: ${e.message}`, 'err');
+        throw e;
+      }
+    }
+  // State for folder tree UI
+  const dirUI = new Map(); // key: dir path ('' for root) -> { li, ul, label }
+  const fileUI = new Map(); // key (relative path) -> {li,status,bar,bytes,size}
+
+    // UX: si on choisit un fichier, on vide le dossier, et inversement + auto-chargement du token
+    window.addEventListener('DOMContentLoaded', () => {
+  const d = $('#dir');
+  if (d) d.addEventListener('change', () => { if (d.files?.length) buildTreeFromDirectorySelection(); });
+      // Charger le token depuis localStorage si présent
+      try {
+        const savedToken = localStorage.getItem('jwtToken');
+        if (savedToken) {
+          $('#token').value = savedToken;
+          log('Token chargé depuis le stockage local.', 'ok');
+        }
+      } catch {}
+      // Enter => submit login
+  const pwd = $('#password');
+      if (pwd) pwd.addEventListener('keydown', (e) => { if (e.key === 'Enter') login(); });
+  // Enter => submit register
+  const regPwd = $('#regPassword');
+  if (regPwd) regPwd.addEventListener('keydown', (e) => { if (e.key === 'Enter') registerUser(); });
+
+      // Branche les selects team/project et auto-chargement si token
+      const teamSel = $('#teamSelect');
+      if (teamSel) teamSel.addEventListener('change', onTeamSelected);
+      const projectSel = $('#projectSelect');
+      if (projectSel) { projectSel.addEventListener('change', onProjectSelected); projectSel.disabled = true; }
+      const tk = ($('#token')?.value || '').trim();
+      if (tk) {
+        loadTeams();
+        const tid = ($('#teamId')?.value || '').trim();
+        if (tid) { if (projectSel) projectSel.disabled = false; loadProjects(tid); }
+      }
+
+      // Auto-chunk UI toggle
+      const auto = $('#autoChunk');
+      const chunk = $('#chunk');
+      const minKB = $('#minChunkKB');
+      const maxMB = $('#maxChunkMB');
+      const tgt = $('#targetMs');
+      function syncAutoUI() {
+        const on = !!(auto && auto.checked);
+        if (chunk) chunk.disabled = on;
+        if (minKB) minKB.disabled = !on;
+        if (maxMB) maxMB.disabled = !on;
+        if (tgt) tgt.disabled = !on;
+      }
+      if (auto) { auto.addEventListener('change', syncAutoUI); syncAutoUI(); }
+
+      // Auto-concurrency UI toggle
+      const autoC = $('#autoConc');
+      const conc = $('#concurrency');
+      const minC = $('#minConc');
+      const maxC = $('#maxConc');
+      function syncAutoConcUI() {
+        const on = !!(autoC && autoC.checked);
+        if (conc) conc.disabled = on;
+        if (minC) minC.disabled = !on;
+        if (maxC) maxC.disabled = !on;
+      }
+      if (autoC) { autoC.addEventListener('change', syncAutoConcUI); syncAutoConcUI(); }
+
+      // Splitter logic (resizable aside)
+      const layout = document.querySelector('.layout');
+      const splitter = document.getElementById('splitter');
+      const aside = document.getElementById('filePanel');
+      const saved = parseInt(localStorage.getItem('asideWidthPx') || '0', 10);
+      if (layout && saved > 0) layout.style.setProperty('--aside-w', `${saved}px`);
+      function setAsideWidth(px) {
+        if (!layout) return;
+        layout.style.setProperty('--aside-w', `${px}px`);
+        try { localStorage.setItem('asideWidthPx', String(px)); } catch {}
+      }
+      if (splitter && layout) {
+        let dragging = false;
+        let onMove = (e) => {
+          if (!dragging) return;
+          const rect = layout.getBoundingClientRect();
+          const total = rect.width;
+          const mainMin = 320; // px
+          const asideMin = 220; // px
+          const x = Math.min(Math.max(e.clientX, rect.left + mainMin), rect.right - asideMin);
+          const asideW = Math.round(rect.right - x);
+          setAsideWidth(asideW);
+        };
+        let onUp = () => {
+          dragging = false;
+          splitter.classList.remove('dragging');
+          document.body.style.userSelect = '';
+          window.removeEventListener('mousemove', onMove);
+          window.removeEventListener('mouseup', onUp);
+        };
+        splitter.addEventListener('mousedown', (e) => {
+          dragging = true;
+          splitter.classList.add('dragging');
+          document.body.style.userSelect = 'none';
+          window.addEventListener('mousemove', onMove);
+          window.addEventListener('mouseup', onUp);
+        });
+        splitter.addEventListener('dblclick', () => setAsideWidth(320));
+      }
+    });
+
+  async function login() {
+      const base = ($('#base').value || '').replace(/\/$/, '');
+      const email = ($('#email').value || '').trim();
+      const password = ($('#password').value || '');
+      if (!email || !password) { alert('Entrez un email et un mot de passe.'); return; }
+      const url = `${base}/api/v1/login`;
+      log(`Connexion → ${url}`);
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password })
+        });
+        const text = await res.text();
+        let data; try { data = JSON.parse(text); } catch { data = undefined; }
+        if (!res.ok) { log(`Login échec: ${data?.error || text || res.status}`, 'err'); return; }
+        const token = data?.token;
+        if (!token) { log('Login: réponse sans token.', 'err'); return; }
+        $('#token').value = token;
+      try { localStorage.setItem('jwtToken', token); } catch {}
+      log('Login réussi. Token appliqué.', 'ok');
+  // Recharger les listes avec le nouveau token
+      try { await loadTeams(); } catch {}
+      const projectSel = $('#projectSelect');
+      const tid = ($('#teamId')?.value || '').trim();
+      if (tid) { if (projectSel) projectSel.disabled = false; try { await loadProjects(tid); } catch {} }
+      } catch (e) {
+        log(`Login exception: ${e.message}`, 'err');
+      }
+    }
+
+  async function registerUser() {
+      const base = ($('#base').value || '').replace(/\/$/, '');
+      const email = ($('#regEmail').value || '').trim();
+      const password = ($('#regPassword').value || '');
+      if (!email || !password) { alert('Entrez un email et un mot de passe.'); return; }
+      const url = `${base}/api/v1/register`;
+      log(`Inscription → ${url}`);
+      try {
+        const res = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ email, password })
+        });
+        const text = await res.text();
+        let data; try { data = JSON.parse(text); } catch { data = undefined; }
+        if (!res.ok) { log(`Inscription échec: ${data?.error || text || res.status}`, 'err'); return; }
+        log(`Inscription réussie: ${data?.message || 'Vérifiez votre e-mail pour confirmer votre compte.'}`, 'ok');
+        // Pré-remplir le formulaire de connexion
+        try { $('#email').value = email; } catch {}
+      } catch (e) {
+        log(`Register exception: ${e.message}`, 'err');
+      }
+    }
+
+    // Right menu UI: tree helpers
+    function ensureDirNode(path) {
+      const norm = path.replace(/^\/+|\/+$/g, '');
+      if (dirUI.has(norm)) return dirUI.get(norm);
+      const parentPath = norm.split('/').slice(0, -1).join('/');
+      const name = norm.split('/').filter(Boolean).pop() || '/';
+      let parent;
+      if (norm === '') {
+        // root
+        const rootUl = document.createElement('ul');
+        rootUl.className = 'tree';
+        const container = $('#tree');
+        container.innerHTML = '';
+        container.appendChild(rootUl);
+        const node = { li: null, ul: rootUl, label: null };
+        dirUI.set('', node);
+        return node;
+      } else {
+        parent = ensureDirNode(parentPath);
+        // create li.dir if not exists
+        const fullKey = norm;
+        if (dirUI.has(fullKey)) return dirUI.get(fullKey);
+        const li = document.createElement('li');
+        li.className = 'dir';
+        const label = document.createElement('div');
+        label.className = 'label';
+        const caret = document.createElement('span'); caret.className = 'caret'; caret.textContent = '▾';
+        const dname = document.createElement('span'); dname.className = 'dirname'; dname.textContent = name;
+        label.appendChild(caret); label.appendChild(dname);
+        const ul = document.createElement('ul');
+        li.appendChild(label); li.appendChild(ul);
+        parent.ul.appendChild(li);
+        label.addEventListener('click', () => {
+          const collapsed = li.classList.toggle('collapsed');
+          caret.textContent = collapsed ? '▸' : '▾';
+        });
+        const node = { li, ul, label };
+        dirUI.set(fullKey, node);
+        return node;
+      }
+    }
+
+    function ensureTreeFileNode(key, size) {
+      if (fileUI.has(key)) return fileUI.get(key);
+      const parts = key.split('/');
+      const fname = parts.pop();
+      const dirPath = parts.join('/');
+      const parent = ensureDirNode(dirPath);
+      const li = document.createElement('li');
+      li.className = 'fileItem';
+      li.dataset.key = key;
+      li.innerHTML = `
+        <div class="fileHead">
+          <div class="fileName" title="${key}">${fname}</div>
+          <span class="badge queued">queued</span>
+        </div>
+        <progress class="fileProg" max="${size}" value="0"></progress>
+        <div class="fileMeta"><span class="bytes">0 / ${human(size)} o</span><span class="muted">${human(size)} o</span></div>
+      `;
+      parent.ul.appendChild(li);
+      const status = li.querySelector('.badge');
+      const bar = li.querySelector('progress');
+      const bytes = li.querySelector('.bytes');
+      const obj = { li, status, bar, bytes, size };
+      fileUI.set(key, obj);
+      return obj;
+    }
+    function human(n) { try { return new Intl.NumberFormat('fr-FR').format(n); } catch { return String(n); } }
+  // Backward-compat alias: avoid breaking existing calls
+  const ensureMenuItem = (key, _name, size) => ensureTreeFileNode(key, size);
+    function setStatus(key, state) {
+      const ui = fileUI.get(key); if (!ui) return;
+      ui.status.className = `badge ${state}`;
+      ui.status.textContent = state === 'progress' ? 'in progress' : state;
+    }
+    function setFileProgress(key, done) {
+      const ui = fileUI.get(key); if (!ui) return;
+      ui.bar.max = ui.size; ui.bar.value = done;
+      ui.bytes.textContent = `${human(done)} / ${human(ui.size)} o`;
+    }
+
+  async function createTeam() {
+      const base = ($('#base').value || '').replace(/\/$/, '');
+      const token = $('#token').value.trim();
+      const name = prompt('Nom de la team ?');
+      if (!name) return;
+      const description = prompt('Description (optionnel) ?') || null;
+      const res = await fetch(`${base}/api/v1/teams/create`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(token ? { 'Authorization': `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ name, description })
+      });
+      const txt = await res.text();
+      if (!res.ok) { log(`Team create fail: ${res.status} ${txt}`, 'err'); return; }
+      try { const data = JSON.parse(txt); $('#teamId').value = data?.team?.id || ''; } catch {}
+      log(`Team créée id=${$('#teamId').value}`, 'ok');
+    }
+
+    async function getTeam() {
+      const base = ($('#base').value || '').replace(/\/$/, '');
+      const token = $('#token').value.trim();
+      const id = ($('#teamId').value || prompt('Team ID ?')).trim();
+      if (!id) return;
+      const res = await fetch(`${base}/api/v1/teams/${id}`, { headers: { ...(token ? { 'Authorization': `Bearer ${token}` } : {}) } });
+      const txt = await res.text();
+      if (!res.ok) { log(`Team details fail: ${res.status} ${txt}`, 'err'); return; }
+      log(`Team: ${txt}`);
+    }
+
+    async function loadTeams() {
+      const base = ($('#base').value || '').replace(/\/$/, '');
+      const token = $('#token').value.trim();
+      if (!token) { log('Impossible de charger les teams: token manquant.', 'err'); return; }
+      try {
+        const res = await fetch(`${base}/api/v1/teams/`, { headers: { 'Accept': 'application/json', 'Authorization': `Bearer ${token}` } });
+        const txt = await res.text();
+        if (!res.ok) { log(`Teams list fail: ${res.status} ${txt}`, 'err'); return; }
+        let data; try { data = JSON.parse(txt); } catch {}
+        const teams = data?.teams || [];
+        const sel = $('#teamSelect'); if (!sel) return;
+        sel.innerHTML = '<option value="">— Sélectionner une équipe —</option>' + teams.map(t => `<option value="${t.id}">${t.name || t.id}</option>`).join('');
+        log(`Teams chargées: ${teams.length}`, 'ok');
+      } catch (e) {
+        log(`Teams list exception: ${e.message}`, 'err');
+      }
+    }
+
+    async function loadProjects(teamId) {
+      const base = ($('#base').value || '').replace(/\/$/, '');
+      const token = $('#token').value.trim();
+      if (!token) { log('Impossible de charger les projets: token manquant.', 'err'); return; }
+      try {
+        const q = teamId ? `?teamId=${encodeURIComponent(teamId)}` : '';
+        const res = await fetch(`${base}/api/v1/projects${q}`, { headers: { 'Accept': 'application/json', 'Authorization': `Bearer ${token}` } });
+        const txt = await res.text();
+        if (!res.ok) { log(`Projects list fail: ${res.status} ${txt}`, 'err'); return; }
+        let data; try { data = JSON.parse(txt); } catch {}
+        const projects = data?.projects || [];
+        const sel = $('#projectSelect'); if (!sel) return;
+        sel.innerHTML = '<option value="">— Sélectionner un projet —</option>' + projects.map(p => `<option value="${p.id}">${p.name || p.id}</option>`).join('');
+        log(`Projets chargés: ${projects.length}`, 'ok');
+      } catch (e) {
+        log(`Projects list exception: ${e.message}`, 'err');
+      }
+    }
+
+    function onTeamSelected() {
+      const teamId = $('#teamSelect').value;
+      $('#teamId').value = teamId || '';
+      const projectSel = $('#projectSelect');
+      if (teamId) {
+        if (projectSel) projectSel.disabled = false;
+        loadProjects(teamId);
+      } else {
+        if (projectSel) {
+          projectSel.disabled = true;
+          projectSel.innerHTML = '<option value="">— Sélectionner un projet —</option>';
+        }
+        $('#projectId').value = '';
+      }
+    }
+
+    function onProjectSelected() {
+      const projectId = $('#projectSelect').value;
+      $('#projectId').value = projectId || '';
+      if (projectId) { 
+        try { 
+          fetchRemoteTreeAndCompare(); 
+          loadProjectKeys(projectId); 
+        } catch {} 
+      }
+    }
+
+    async function createProject() {
+      const base = ($('#base').value || '').replace(/\/$/, '');
+      const token = $('#token').value.trim();
+      const teamId = $('#teamId').value.trim() || prompt('Team ID ?') || '';
+      if (!teamId) { alert('teamId requis'); return; }
+      const name = prompt('Nom du projet ?');
+      if (!name) return;
+      
+      // Ask if user wants E2EE
+      const e2eeChoice = confirm('Voulez-vous activer le chiffrement bout-en-bout (E2EE) pour ce projet ?');
+      
+      let payload = { name, teamId };
+      
+      if (e2eeChoice) {
+        try {
+          if (!hasLibSodium()) { await loadSodiumWithFallbacks(); }
+          await ensureUserKeys();
+          const { projectKey, pkId } = await generateProjectKey();
+          const wrappedPK = await wrapProjectKeyForRecipient(projectKey, userKeys.publicKey);
+          
+          // Get current user ID (simplified - in real app you'd get this properly)
+          const userId = 'user-' + Math.random().toString(36).substr(2, 9);
+          
+          payload.pkId = pkId;
+          payload.wrappedPKs = [{
+            userId: userId,
+            pubKeyId: userKeys.keyId,
+            wrappedPK: wrappedPK
+          }];
+          
+          // Store project key locally for this session
+          projectKeys = { pkId, projectKey, recipients: [{ userId, pubKeyId: userKeys.keyId }] };
+          
+          log('Projet E2EE configuré localement', 'ok');
+        } catch (e) {
+          log(`Erreur configuration E2EE: ${e.message}`, 'err');
+          return;
+        }
+      }
+      
+      const res = await fetch(`${base}/api/v1/projects`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(token ? { 'Authorization': `Bearer ${token}` } : {}) },
+        body: JSON.stringify(payload)
+      });
+      const txt = await res.text();
+      if (!res.ok) { log(`Project create fail: ${res.status} ${txt}`, 'err'); return; }
+      try { const data = JSON.parse(txt); $('#projectId').value = data?.project?.id || ''; } catch {}
+      log(`Projet créé id=${$('#projectId').value}${e2eeChoice ? ' (E2EE activé)' : ''}`, 'ok');
+    }
+
+    async function getProject() {
+      const base = ($('#base').value || '').replace(/\/$/, '');
+      const token = $('#token').value.trim();
+      const id = ($('#projectId').value || prompt('Project ID ?')).trim();
+      if (!id) return;
+      const res = await fetch(`${base}/api/v1/projects/${id}`, { headers: { ...(token ? { 'Authorization': `Bearer ${token}` } : {}) } });
+      const txt = await res.text();
+      if (!res.ok) { log(`Project details fail: ${res.status} ${txt}`, 'err'); return; }
+      log(`Project: ${txt}`);
+    }
+
+  // Single-file flow removed: only folder mode kept
+
+    // Helpers paramétrés pour usage dossier
+    async function initOne(file, base, token, relPath, e2eeData = null) {
+      const projectId = $('#projectId').value.trim() || prompt('Project ID ?') || '';
+      if (!projectId) throw unhandled
+      if (!projectId) throw new Error('projectId requis');
+      
+      const payload = { 
+        filename: file.name, 
+        path: relPath || file.name, 
+        mime: file.type || 'application/octet-stream', 
+        size: e2eeData ? e2eeData.cipher.length : file.size
+      };
+      
+      // Add E2EE metadata if encrypting
+      if (e2eeData) {
+        payload.e2eeHeader = e2eeData.header;
+        payload.e2eeKey = e2eeData.key;
+        payload.pkRef = e2eeData.key.pkRef;
+      }
+      
+      const res = await fetch(`${base}/api/v1/projects/${projectId}/uploads`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+        },
+        body: JSON.stringify(payload),
+      });
+      if (!res.ok) throw new Error(`init failed ${res.status}`);
+      const data = await res.json();
+      const id = data.uploadId || data.id;
+      const patchUrl = data.tusEndpoint || `${base}/api/v1/projects/${projectId}/uploads/${id}`;
+      let skip = false;
+      try {
+        const remoteSha = (data.sha256 || data.hash || '') ? String(data.sha256 || data.hash).toLowerCase() : null;
+        if (remoteSha && !e2eeData) { // Only check hash for non-encrypted files
+          const localSha = (await sha256HexOfFile(file)).toLowerCase();
+          if (localSha === remoteSha) {
+            skip = true;
+            log(`Hash identique (serveur) pour ${relPath} → saut upload.`, 'ok');
+          }
+        }
+      } catch {}
+      return { id, patchUrl, skip, encryptedData: e2eeData };
+    }
+
+    async function finalizeOne(id, base, token) {
+      const projectId = $('#projectId').value.trim() || prompt('Project ID ?') || '';
+      if (!projectId) throw new Error('projectId requis');
+      const res = await fetch(`${base}/api/v1/projects/${projectId}/uploads/${id}/finalize`, {
+        method: 'POST',
+        headers: { ...(token ? { 'Authorization': `Bearer ${token}` } : {}) },
+      });
+      if (!res.ok) throw new Error(`finalize failed ${res.status}`);
+      return res;
+    }
+
+    // --- WebSocket live updates ---
+    let ws;
+    const wsSubs = new Set();
+    function wsConnect() {
+      const base = ($('#base').value || '').replace(/\/$/, '');
+      const loc = new URL(base || window.location.origin);
+  const wsUrl = `${loc.protocol === 'https:' ? 'wss' : 'ws'}://${loc.host}/ws`;
+      try {
+        ws = new WebSocket(wsUrl);
+        ws.onopen = () => { log(`WS connecté: ${wsUrl}`, 'ok'); wsSubs.forEach(t => ws.send(`SUB ${t}`)); };
+        ws.onclose = () => { log('WS fermé. Reconnexion dans 3s…'); setTimeout(() => wsConnect(), 3000); };
+        ws.onerror = (e) => { /* silent */ };
+        ws.onmessage = (ev) => {
+          try {
+            const m = JSON.parse(ev.data);
+            if (m?.type === 'status' && m.uploadId) {
+              log(`Statut [${m.uploadId}]: ${m.status}`);
+            } else if (m?.type === 'finalized' && m.uploadId) {
+              log(`Finalisé [${m.uploadId}] sha=${m.sha256}`,'ok');
+            } else if (m?.type === 'indexing') {
+              const phase = m.phase || 'indexing';
+              log(`Indexation: ${phase}${m.target? ` → ${m.target}`:''}`);
+            }
+          } catch {}
+        };
+      } catch (e) { log(`WS erreur: ${e.message}`, 'err'); }
+    }
+    // connect early
+    window.addEventListener('DOMContentLoaded', wsConnect);
+    function wsSubscribeUpload(id) {
+      const topic = `upload:${id}`;
+      wsSubs.add(topic);
+      try { if (ws?.readyState === 1) ws.send(`SUB ${topic}`); } catch {}
+    }
+
+    function buildTreeFromDirectorySelection() {
+      const list = $('#dir').files;
+      const container = $('#tree');
+      if (!list || list.length === 0) { container.innerHTML = '<div class="muted">Aucun dossier sélectionné.</div>'; return; }
+      // reset caches
+      dirUI.clear(); fileUI.clear();
+      ensureDirNode('');
+      const files = Array.from(list).sort((a,b) => (a.webkitRelativePath||a.name).localeCompare(b.webkitRelativePath||b.name));
+      files.forEach(f => {
+        const rel = f.webkitRelativePath || f.name;
+        ensureTreeFileNode(rel, f.size);
+        setStatus(rel, 'queued');
+        setFileProgress(rel, 0);
+      });
+      log(`Arborescence chargée: ${files.length} fichiers.`, 'ok');
+      // Try remote compare when both project and token are present
+      try { fetchRemoteTreeAndCompare(); } catch {}
+    }
+
+    async function fetchRemoteTreeAndCompare() {
+      const base = ($('#base').value || '').replace(/\/$/, '');
+      const token = $('#token').value.trim();
+      const projectId = $('#projectId').value.trim();
+      const list = $('#dir').files;
+      if (!projectId || !list || list.length === 0) return; // need both
+      const url = `${base}/api/v1/projects/${projectId}/tree`;
+      log(`Chargement de l'arborescence distante → ${url}`);
+      try {
+        const res = await fetch(url, { headers: { 'Accept': 'application/json', ...(token ? { 'Authorization': `Bearer ${token}` } : {}) } });
+        const txt = await res.text();
+        if (!res.ok) { log(`Tree remote fail: ${res.status} ${txt}`, 'err'); return; }
+        let data; try { data = JSON.parse(txt); } catch { data = undefined; }
+        const remote = (data?.tree || []).reduce((m, it) => { if (it?.path) m.set(String(it.path), { size: +it.size || 0, sha256: (it.sha256 || '').toLowerCase() || null }); return m; }, new Map());
+        // Compute local hashes in parallel (bounded)
+        const files = Array.from(list);
+        const items = files.map(f => ({ file: f, rel: f.webkitRelativePath || f.name, size: f.size }));
+        const limit = 4;
+        let i = 0;
+        await Promise.all(new Array(Math.min(limit, items.length)).fill(0).map(async () => {
+          while (i < items.length) {
+            const idx = i++;
+            const it = items[idx];
+            try {
+              const localSha = (await sha256HexOfFile(it.file)).toLowerCase();
+              const r = remote.get(it.rel);
+              if (!r) {
+                setStatus(it.rel, 'queued'); // new file → keep as queued
+              } else if (r.sha256 && r.sha256 === localSha) {
+                setStatus(it.rel, 'equivalent');
+                setFileProgress(it.rel, it.size);
+              } else {
+                setStatus(it.rel, 'queued'); // modified → queued
+              }
+            } catch (e) {
+              // ignore hashing error; leave as queued
+            }
+          }
+        }));
+        log(`Comparaison locale vs distante terminée.`, 'ok');
+      } catch (e) {
+        log(`Tree compare exception: ${e.message}`, 'err');
+      }
+    }
+
+    async function runFolder() {
+      const list = $('#dir').files;
+      if (!list || list.length === 0) { alert('Choisir un dossier'); return; }
+      const base = ($('#base').value || '').replace(/\/$/, '');
+      const token = $('#token').value.trim();
+  const auto = $('#autoChunk')?.checked;
+  const chunkMB = parseFloat($('#chunk')?.value) || 2;
+  const initialChunk = Math.max(256*1024, Math.floor(chunkMB * 1024 * 1024));
+  const minChunk = Math.max(64*1024, Math.floor((parseFloat($('#minChunkKB')?.value) || 256) * 1024));
+  const maxChunk = Math.max(minChunk, Math.floor((parseFloat($('#maxChunkMB')?.value) || 16) * 1024 * 1024));
+  const targetMs = Math.max(200, Math.floor((parseFloat($('#targetMs')?.value) || 800)));
+  const concurrency = Math.max(1, parseInt($('#concurrency')?.value || '3', 10));
+  const autoConc = $('#autoConc')?.checked;
+  const minConc = Math.max(1, parseInt($('#minConc')?.value || '1', 10));
+  const maxConc = Math.max(minConc, parseInt($('#maxConc')?.value || '6', 10));
+
+      // Overall progress
+      const files = Array.from(list);
+      const totalBytes = files.reduce((s, f) => s + f.size, 0);
+      const pAll = $('#progressAll');
+      const bAll = $('#bytesAll');
+      pAll.max = totalBytes; pAll.value = 0; bAll.textContent = `0 / ${totalBytes}`;
+      setPercent(0, totalBytes);
+
+      // Prepare right menu and internal state
+      // Check if project has E2EE enabled
+      let useE2EE = false;
+      if (projectKeys) {
+        useE2EE = confirm('Ce projet utilise E2EE. Voulez-vous chiffrer les fichiers ? (Recommandé)');
+        if (useE2EE) {
+          log('Mode E2EE activé pour cet upload', 'ok');
+        }
+      }
+
+  // Rebuild tree UI to reflect the new selection
+  buildTreeFromDirectorySelection();
+  const items = files.map(f => ({ 
+    file: f, 
+    rel: f.webkitRelativePath || f.name, 
+    size: f.size, 
+    id: null, 
+    patchUrl: null, 
+    initOk: false, 
+    uploadOk: false, 
+    skip: false,
+    e2eeData: null 
+  }));
+
+      let processed = 0;
+      const updateOverall = (delta) => {
+        processed += delta;
+        pAll.value = processed; bAll.textContent = `${processed} / ${totalBytes}`;
+        setPercent(processed, totalBytes);
+      };
+
+      // Small promise pool helper
+      async function runWithConcurrency(arr, limit, worker) {
+        let i = 0;
+        const runners = new Array(Math.min(limit, arr.length)).fill(0).map(async () => {
+          while (i < arr.length) {
+            const idx = i++;
+            try { await worker(arr[idx], idx); } catch (e) { /* errors are logged in worker */ }
+          }
+        });
+        await Promise.all(runners);
+      }
+
+  // (Aucune vérif locale) : on dépend uniquement du hash fourni par le serveur à l'init
+
+  // Phase 1: init all files (fast), so the site doesn't wait for finished to start uploads
+    log('Initialisation (serveur) pour tous les fichiers…');
+      // Encrypt files if E2EE is enabled
+      if (useE2EE && projectKeys) {
+        log('Chiffrement des fichiers en cours...', 'ok');
+        await runWithConcurrency(items, Math.min(concurrency, 4), async (it) => {
+          try {
+            setStatus(it.rel, 'progress');
+            it.e2eeData = await encryptFile(it.file, projectKeys.projectKey);
+            it.size = it.e2eeData.cipher.length; // Update size to encrypted size
+            setStatus(it.rel, 'queued');
+            log(`Fichier chiffré: ${it.rel} (${Math.round(it.size/1024)} KiB)`, 'ok');
+          } catch (e) {
+            log(`Erreur chiffrement ${it.rel}: ${e.message}`, 'err');
+            setStatus(it.rel, 'error');
+          }
+        });
+      }
+
+      await runWithConcurrency(items, Math.min(concurrency * 2, 8), async (it) => {
+        if (it.e2eeData && !it.e2eeData) return; // Skip files that failed encryption
+        try {
+      const { id, patchUrl, skip, encryptedData } = await initOne(it.file, base, token, it.rel, it.e2eeData);
+      it.id = id; it.patchUrl = patchUrl; it.initOk = true; it.skip = skip;
+  if (id) wsSubscribeUpload(id);
+      log(`Init OK: ${it.rel} → ${id}${skip ? ' (identique – pas d\'upload)' : ''}`, skip ? 'ok' : '');
+      if (skip) { setStatus(it.rel, 'equivalent'); setFileProgress(it.rel, it.size); updateOverall(it.size); }
+        } catch (e) {
+          log(`Init échec pour ${it.rel}: ${e.message}`, 'err');
+          setStatus(it.rel, 'error');
+        }
+      });
+
+      // Phase 2: upload chunks for all files in parallel (file-level concurrency)
+      log(`Démarrage des envois (fichiers non identiques)…${auto ? ` (auto-chunk: cible ${targetMs} ms, min ${Math.round(minChunk/1024)} KiB, max ${Math.round(maxChunk/1024/1024)} MiB)` : ` (chunk fixe ${Math.round(initialChunk/1024/1024*100)/100} MiB)`}${autoConc ? `, auto-concurrency (min ${minConc}, max ${maxConc})` : ''}`);
+
+      async function uploadOne(it) {
+        setStatus(it.rel, 'progress');
+        let last = 0;
+        let offset = 0;
+        let chunkSize = initialChunk;
+        let emaBps = null; // exponential moving average of bytes per second
+        const alpha = 0.3; // smoothing factor
+        const tStart = performance.now();
+        
+        // Use encrypted data if available
+        const dataToUpload = it.e2eeData ? it.e2eeData.cipher : it.file;
+        const totalSize = it.e2eeData ? it.e2eeData.cipher.length : it.file.size;
+        
+        while (offset < totalSize) {
+          const end = Math.min(offset + chunkSize, totalSize);
+          let slice;
+          
+          if (it.e2eeData) {
+            // Upload encrypted data
+            slice = new Blob([it.e2eeData.cipher.slice(offset, end)]);
+          } else {
+            // Upload original file
+            slice = it.file.slice(offset, end);
+          }
+          
+          const t0 = performance.now();
+          const res = await fetch(it.patchUrl, {
+            method: 'PATCH',
+            headers: {
+              'Content-Type': 'application/octet-stream',
+              'X-Upload-Filename': it.file.name,
+              ...(token ? { 'Authorization': `Bearer ${token}` } : {}),
+            },
+            body: slice,
+          });
+          if (!res.ok) {
+            const text = await res.text();
+            log(`Chunk ${offset}-${end} échec pour ${it.rel}: ${res.status} ${text}`, 'err');
+            setStatus(it.rel, 'error');
+            return { bytes: end, ms: performance.now() - tStart, ok: false };
+          }
+          const t1 = performance.now();
+          const dtMs = Math.max(1, t1 - t0);
+          const sent = end - offset;
+          const instBps = (sent * 1000) / dtMs;
+          emaBps = emaBps == null ? instBps : (alpha * instBps + (1 - alpha) * emaBps);
+
+          setFileProgress(it.rel, end);
+          updateOverall(end - last);
+          last = end;
+          offset = end;
+
+          if (auto) {
+            // Compute ideal next chunk to hit target duration, clamp and rate-limit growth/shrink
+            let ideal = Math.floor((emaBps * targetMs) / 1000);
+            ideal = Math.min(Math.max(ideal, minChunk), maxChunk);
+            const growthLimit = 1.7; // max x per step
+            const shrinkLimit = 0.7; // min x per step
+            if (ideal > chunkSize * growthLimit) chunkSize = Math.floor(chunkSize * growthLimit);
+            else if (ideal < chunkSize * shrinkLimit) chunkSize = Math.floor(chunkSize * shrinkLimit);
+            else chunkSize = ideal;
+            // Safety floor
+            chunkSize = Math.max(64 * 1024, chunkSize);
+          }
+        }
+        it.uploadOk = true;
+        return { bytes: totalSize, ms: performance.now() - tStart, ok: true };
+      }
+
+      // Adaptive concurrency in waves
+      let desiredConc = autoConc ? Math.max(minConc, Math.min(maxConc, concurrency)) : concurrency;
+      let prevThroughput = null; // bytes/ms
+      let pending = items.filter(it => it.initOk && !it.skip);
+      while (pending.length > 0) {
+        const batch = pending.splice(0, desiredConc);
+        const wallStart = performance.now();
+        const results = await Promise.all(batch.map(uploadOne));
+        const wallEnd = performance.now();
+        const batchDurationMs = Math.max(1, wallEnd - wallStart);
+        const batchBytes = results.reduce((s, r) => s + (r?.bytes || 0), 0);
+        const tput = batchBytes / batchDurationMs; // bytes/ms
+        log(`Wave terminée: ${batch.length} fichiers, ${Math.round(batchBytes/1024/1024*100)/100} MiB en ${Math.round(batchDurationMs)} ms → ${Math.round(tput*1000/1024/1024*100)/100} MiB/s`);
+        if (autoConc) {
+          if (prevThroughput != null) {
+            if (tput > prevThroughput * 1.10 && desiredConc < maxConc) {
+              desiredConc += 1;
+              log(`↗️ Concurrency augmenté → ${desiredConc}`);
+            } else if (tput < prevThroughput * 0.90 && desiredConc > minConc) {
+              desiredConc -= 1;
+              log(`↘️ Concurrency diminué → ${desiredConc}`);
+            } else {
+              // keep
+            }
+          }
+          prevThroughput = tput;
+        }
+      }
+
+  // Phase 3: finalize all at the end
+      log('Finalisation des uploads envoyés…');
+      await runWithConcurrency(items, Math.min(concurrency, 5), async (it) => {
+        if (it.skip) return; // identical → pas de finalize
+        if (!it.uploadOk) return; // pas uploadé
+        try { await finalizeOne(it.id, base, token); setStatus(it.rel, 'done'); log(`Finalize OK pour ${it.rel}`, 'ok'); }
+        catch (e) { setStatus(it.rel, 'error'); log(`Finalize échec pour ${it.rel}: ${e.message}`, 'err'); }
+      });
+
+  log('Dossier traité (inits → uploads → finalisations terminées).', 'ok');
+      setPercent(totalBytes, totalBytes);
+    }
+
+    // ========== E2EE UI Functions ==========
+    // Load libsodium from a list of CDN candidates, first that works wins
+    const SODIUM_CDNS_UMD = [
+      // Latest pinned UMD builds
+      'https://cdn.jsdelivr.net/npm/libsodium-wrappers@0.7.15/dist/browsers/sodium.js',
+      'https://unpkg.com/libsodium-wrappers@0.7.15/dist/browsers/sodium.js',
+      // Floating latest
+      'https://unpkg.com/libsodium-wrappers/dist/browsers/sodium.js',
+      'https://cdn.jsdelivr.net/npm/libsodium-wrappers/dist/browsers/sodium.js',
+      // Previous versions as fallback
+      'https://unpkg.com/libsodium-wrappers@0.7.14/dist/browsers/sodium.js',
+      'https://cdn.jsdelivr.net/npm/libsodium-wrappers@0.7.14/dist/browsers/sodium.js'
+    ];
+    const SODIUM_CDNS_ESM = [
+      // ESM builds (need dynamic import)
+      'https://cdn.jsdelivr.net/npm/libsodium-wrappers@0.7.15/dist/modules/libsodium-wrappers.js',
+      'https://unpkg.com/libsodium-wrappers@0.7.15/dist/modules/libsodium-wrappers.js'
+    ];
+
+    function loadScriptOnce(src, timeoutMs = 10000) {
+      return new Promise((resolve, reject) => {
+        const s = document.createElement('script');
+        let done = false;
+        const timer = setTimeout(() => {
+          if (done) return;
+          done = true; try { s.remove(); } catch {}
+          reject(new Error('Timeout chargement script'));
+        }, timeoutMs);
+        s.src = src;
+        s.async = true;
+        s.onload = async () => {
+          if (done) return; done = true; clearTimeout(timer);
+          try { if (window.sodium && window.sodium.ready) { await window.sodium.ready; } } catch {}
+          resolve(true);
+        };
+        s.onerror = () => {
+          if (done) return; done = true; clearTimeout(timer);
+          reject(new Error('Erreur chargement script'));
+        };
+        document.head.appendChild(s);
+      });
+    }
+
+    async function loadSodiumWithFallbacks() {
+      const tried = [];
+      // Try UMD builds first (attach window.sodium)
+      for (const url of SODIUM_CDNS_UMD) {
+        try {
+          log(`Chargement libsodium (UMD) → ${url}`);
+          await loadScriptOnce(url, 12000);
+          if (window.sodium) {
+            await window.sodium.ready;
+            log('✅ libsodium chargé (UMD)', 'ok');
+            return true;
+          }
+          tried.push(`${url} (chargé mais window.sodium indisponible)`);
+        } catch (e) {
+          tried.push(`${url} (${e.message})`);
+        }
+      }
+      // Try ESM builds via dynamic import and map to window.sodium for the rest of the code
+      for (const url of SODIUM_CDNS_ESM) {
+        try {
+          log(`Chargement libsodium (ESM) → ${url}`);
+          const mod = await import(/* @vite-ignore */ url);
+          const sodium = mod?.default || mod;
+          if (sodium) {
+            if (sodium.ready) { await sodium.ready; }
+            window.sodium = sodium;
+            log('✅ libsodium chargé (ESM)', 'ok');
+            return true;
+          }
+          tried.push(`${url} (importé mais module invalide)`);
+        } catch (e) {
+          tried.push(`${url} (${e.message})`);
+        }
+      }
+      log('❌ Tous les miroirs libsodium ont échoué:\n' + tried.join('\n'), 'err');
+      throw new Error('Impossible de charger libsodium');
+    }
+    async function initE2EE() {
+      log('Chargement de libsodium...', 'ok');
+      try {
+        if (typeof window.sodium === 'undefined') {
+          await loadSodiumWithFallbacks();
+        } else {
+          await window.sodium.ready;
+          log('✅ libsodium déjà disponible', 'ok');
+        }
+        await ensureUserKeys();
+      } catch (e) {
+        log(`Erreur init E2EE: ${e.message}`, 'err');
+      }
+    }
+
+    async function testE2EE() {
+      try {
+  if (!hasLibSodium()) { await loadSodiumWithFallbacks(); }
+        
+        await ensureUserKeys();
+        log(`✅ Test E2EE OK - Clé utilisateur: ${userKeys.keyId}`, 'ok');
+        
+        // Test project key generation
+        const { projectKey, pkId } = await generateProjectKey();
+        const wrapped = await wrapProjectKeyForRecipient(projectKey, userKeys.publicKey);
+        const unwrapped = await unwrapProjectKey(wrapped);
+        
+        const match = projectKey.length === unwrapped.length && 
+                     projectKey.every((b, i) => b === unwrapped[i]);
+        
+        log(`✅ Test wrap/unwrap project key: ${match ? 'OK' : 'ÉCHEC'}`, match ? 'ok' : 'err');
+        
+        // Test file encryption (small test)
+        const testFile = new File(['Hello E2EE World!'], 'test.txt', { type: 'text/plain' });
+        const encrypted = await encryptFile(testFile, projectKey);
+        log(`✅ Test chiffrement fichier: ${encrypted.cipher.length} octets chiffrés`, 'ok');
+        
+      } catch (e) {
+        log(`❌ Test E2EE échoué: ${e.message}`, 'err');
+      }
+    }
+
+    function showE2EEInfo() {
+      const info = `
+🔐 Guide Chiffrement Bout-en-Bout (E2EE)
+
+1. ACTIVATION
+   • Cliquez "Activer E2EE" pour charger libsodium
+   • Créez ou saisissez votre mot de passe maître
+   • Vos clés sont générées et stockées localement
+
+2. PROJETS E2EE
+   • Lors de la création d'un projet, choisissez "E2EE"
+   • Une clé de projet est générée et chiffrée pour vous
+   • Seuls les membres autorisés peuvent déchiffrer
+
+3. UPLOAD CHIFFRÉ
+   • Les fichiers sont chiffrés côté client avant envoi
+   • Le serveur ne voit que des données chiffrées
+   • Chaque fichier a sa propre clé de fichier
+
+4. GESTION MEMBRES
+   • Ajoutez des membres avec leurs clés publiques
+   • Rotation des clés pour révoquer l'accès
+   • Suppression sécurisée avec re-chiffrement
+
+5. SÉCURITÉ
+   • Clés privées chiffrées par Argon2id (mot de passe)
+   • Algorithmes: X25519, XChaCha20-Poly1305
+   • Zéro connaissance serveur (zero-knowledge)
+
+⚠️ IMPORTANT: Sauvegardez votre mot de passe !
+   Sans lui, vos données sont irrécupérables.
+      `;
+      alert(info);
+    }
+
+    async function manageMembres() {
+      const projectId = $('#projectId').value.trim();
+      if (!projectId) {
+        alert('Sélectionnez un projet d\'abord');
+        return;
+      }
+
+      const action = prompt(`
+Gestion des membres E2EE pour le projet ${projectId}:
+
+1. Ajouter un membre
+2. Lister les membres
+3. Supprimer un membre
+4. Rotation des clés
+
+Votre choix (1-4):
+      `);
+
+      switch (action) {
+        case '1':
+          await addProjectMember(projectId);
+          break;
+        case '2':
+          await listProjectMembers(projectId);
+          break;
+        case '3':
+          await removeProjectMember(projectId);
+          break;
+        case '4':
+          await rotateProjectKeys(projectId);
+          break;
+        default:
+          return;
+      }
+    }
+
+    async function addProjectMember(projectId) {
+      const userId = prompt('User ID du nouveau membre:');
+      const pubKeyId = prompt('Public Key ID du membre:');
+      if (!userId || !pubKeyId) return;
+
+      if (!projectKeys) {
+        alert('Clés de projet non disponibles localement');
+        return;
+      }
+
+      try {
+        // In a real app, you'd fetch the user's public key from the server
+        const pubKeyB64 = prompt('Clé publique du membre (base64):');
+        if (!pubKeyB64) return;
+
+        await window.sodium.ready;
+        const memberPubKey = window.sodium.from_base64(pubKeyB64);
+        const wrappedPK = await wrapProjectKeyForRecipient(projectKeys.projectKey, memberPubKey);
+
+        const base = ($('#base').value || '').replace(/\/$/, '');
+        const token = $('#token').value.trim();
+
+        const res = await fetch(`${base}/api/v1/projects/${projectId}/members`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify({
+            userId,
+            pubKeyId,
+            wrappedPK,
+            pkId: projectKeys.pkId
+          })
+        });
+
+        if (res.ok) {
+          log(`✅ Membre ${userId} ajouté au projet E2EE`, 'ok');
+        } else {
+          const err = await res.text();
+          log(`❌ Erreur ajout membre: ${err}`, 'err');
+        }
+      } catch (e) {
+        log(`❌ Exception ajout membre: ${e.message}`, 'err');
+      }
+    }
+
+    async function listProjectMembers(projectId) {
+      // This would require a GET endpoint to list project members
+      // For now, just show a placeholder
+      log(`📋 Membres du projet ${projectId}: (endpoint non implémenté)`, 'muted');
+    }
+
+    async function removeProjectMember(projectId) {
+      const memberUserId = prompt('User ID du membre à supprimer:');
+      if (!memberUserId) return;
+
+      // This would require generating new project keys and re-encrypting for remaining members
+      // For this POC, we'll just call the API
+      try {
+        const base = ($('#base').value || '').replace(/\/$/, '');
+        const token = $('#token').value.trim();
+
+        // In a real app, you'd generate new keys and wrap them for remaining members
+        const newPkId = `pk-${Date.now()}-rotated`;
+        const newWrappedPKs = []; // This would contain wrapped keys for remaining members
+
+        const res = await fetch(`${base}/api/v1/projects/${projectId}/members/${memberUserId}`, {
+          method: 'DELETE',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify({
+            newPkId,
+            newWrappedPKs
+          })
+        });
+
+        if (res.ok) {
+          log(`✅ Membre ${memberUserId} supprimé et clés rotées`, 'ok');
+        } else {
+          const err = await res.text();
+          log(`❌ Erreur suppression membre: ${err}`, 'err');
+        }
+      } catch (e) {
+        log(`❌ Exception suppression membre: ${e.message}`, 'err');
+      }
+    }
+
+    async function rotateProjectKeys(projectId) {
+      if (!projectKeys) {
+        alert('Clés de projet non disponibles localement');
+        return;
+      }
+
+      try {
+        const base = ($('#base').value || '').replace(/\/$/, '');
+        const token = $('#token').value.trim();
+
+        // Generate new project key
+        const { projectKey: newProjectKey, pkId: newPkId } = await generateProjectKey();
+        
+        // In a real app, you'd fetch current members and wrap the new key for each
+        // For this POC, we'll just wrap for the current user
+        await ensureUserKeys();
+        const newWrappedPK = await wrapProjectKeyForRecipient(newProjectKey, userKeys.publicKey);
+        
+        const newWrappedPKs = [{
+          userId: 'current-user', // In real app, get from user profile
+          pubKeyId: userKeys.keyId,
+          wrappedPK: newWrappedPK
+        }];
+
+        const res = await fetch(`${base}/api/v1/projects/${projectId}/rotate`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
+          body: JSON.stringify({
+            newPkId,
+            newWrappedPKs
+          })
+        });
+
+        if (res.ok) {
+          // Update local project keys
+          projectKeys = { pkId: newPkId, projectKey: newProjectKey, recipients: newWrappedPKs };
+          log(`✅ Clés de projet rotées: ${newPkId}`, 'ok');
+        } else {
+          const err = await res.text();
+          log(`❌ Erreur rotation clés: ${err}`, 'err');
+        }
+      } catch (e) {
+        log(`❌ Exception rotation clés: ${e.message}`, 'err');
+      }
+    }
+  </script>
+</head>
+<body>
+  <div class="layout">
+    <main>
+  <h1>Test Upload (dossier uniquement, résumable par chunks)</h1>
+
+      <fieldset>
+        <legend>Configuration</legend>
+        <label>Base URL API (optionnel, vide = même origine)
+          <input id="base" type="text" placeholder="https://api.exemple.com" />
+        </label>
+        <label>Token Bearer (optionnel)
+          <input id="token" type="text" placeholder="eyJhbGciOi..." />
+        </label>
+        <div class="row">
+          <button onclick="initE2EE()" title="Charger libsodium pour E2EE">🔐 Activer E2EE</button>
+          <button onclick="testE2EE()" title="Tester la génération de clés">🔑 Test clés</button>
+        </div>
+  <small class="muted">La déduplication se fait uniquement via le SHA-256 fourni par le serveur lors de l'init. E2EE désactive la déduplication.</small>
+      </fieldset>
+
+      <fieldset>
+        <legend>Connexion</legend>
+        <div class="row">
+          <label>Email
+            <input id="email" type="email" autocomplete="username" placeholder="you@example.com" />
+          </label>
+          <label>Mot de passe
+            <input id="password" type="password" autocomplete="current-password" />
+          </label>
+          <div>
+            <button class="primary" onclick="login()">Se connecter</button>
+          </div>
+        </div>
+        <small class="muted">POST /api/v1/login renvoie { token }. Le token est copié dans le champ ci-dessus.</small>
+      </fieldset>
+
+      <fieldset>
+        <legend>Inscription</legend>
+        <div class="row">
+          <label>Email
+            <input id="regEmail" type="email" autocomplete="email" placeholder="you@example.com" />
+          </label>
+          <label>Mot de passe
+            <input id="regPassword" type="password" autocomplete="new-password" />
+          </label>
+          <div>
+            <button onclick="registerUser()">S'inscrire</button>
+          </div>
+        </div>
+        <small class="muted">POST /api/v1/register crée un compte et envoie un e‑mail de confirmation.</small>
+      </fieldset>
+
+      <fieldset>
+  <legend>Projet et sélection</legend>
+        <div class="row">
+          <label>Team ID
+            <input id="teamId" type="text" placeholder="UUID team" />
+          </label>
+          <label>Teams
+            <select id="teamSelect"></select>
+          </label>
+          <button onclick="loadTeams()">↻</button>
+          <button onclick="createTeam()">Créer team</button>
+          <button onclick="getTeam()">Voir team</button>
+        </div>
+        <div class="row">
+          <label>Project ID
+            <input id="projectId" type="text" placeholder="ID projet (int)" />
+          </label>
+          <label>Projects
+            <select id="projectSelect"></select>
+          </label>
+          <button onclick="loadProjects($('#teamId').value.trim() || undefined)">↻</button>
+          <button onclick="createProject()">Créer projet</button>
+          <button onclick="getProject()">Voir projet</button>
+        </div>
+        <div class="row">
+          <label>Chunk (MiB)
+            <input id="chunk" type="number" value="2" min="0.25" step="0.25" />
+          </label>
+          <label>
+            <input id="autoChunk" type="checkbox" /> Auto
+          </label>
+          <label>Min (KiB)
+            <input id="minChunkKB" type="number" value="256" min="64" step="64" />
+          </label>
+          <label>Max (MiB)
+            <input id="maxChunkMB" type="number" value="16" min="1" step="1" />
+          </label>
+          <label>Cible (ms)
+            <input id="targetMs" type="number" value="800" min="200" step="50" />
+          </label>
+        </div>
+        <small class="muted">En mode Auto, la taille s'adapte pour viser ~cible ms par chunk selon le débit mesuré, bornée par min/max.</small>
+        <div class="row">
+          <label>Dossier (envoi récursif)
+            <input id="dir" type="file" webkitdirectory directory multiple />
+          </label>
+          <small class="muted">Ce client ne gère que le mode dossier.</small>
+        </div>
+        <div class="row">
+          <button onclick="runFolder()">Tout dossier (parallèle)</button>
+        </div>
+        <div class="row" style="margin-top:.5rem">
+          <progress id="progressAll" value="0" max="100"></progress>
+          <span id="bytesAll" class="muted">0 / 0</span>
+        </div>
+        <div class="row" style="margin-top:.5rem">
+          <label>Progression (%)</label>
+          <progress id="progressPct" value="0" max="100"></progress>
+          <span id="pctText" class="muted">0%</span>
+        </div>
+      </fieldset>
+
+      <fieldset>
+        <legend>Logs</legend>
+        <div id="log" as="pre" style="max-height:40vh; overflow:auto; border:1px solid #ddd; padding: .75rem; background:#f9fafb"></div>
+      </fieldset>
+
+      <p class="muted">Ce client de test envoie des chunks via PATCH vers l'API Symfony, puis appelle finalize. Consultez les logs serveur/Monolog pour le suivi complet.</p>
+      
+      <fieldset>
+        <legend>🔐 Chiffrement bout-en-bout (E2EE)</legend>
+        <div class="row">
+          <button onclick="showE2EEInfo()">ℹ️ Guide E2EE</button>
+          <button onclick="manageMembres()">👥 Gérer membres</button>
+        </div>
+        <small class="muted">
+          Le chiffrement E2EE utilise XChaCha20-Poly1305 + sealed box (X25519). 
+          Les clés privées sont chiffrées avec Argon2id côté client.
+          Le serveur ne voit jamais les données en clair.
+        </small>
+      </fieldset>
+    </main>
+  <div id="splitter" class="splitter" aria-label="Redimensionner" role="separator" aria-orientation="vertical" tabindex="0"></div>
+  <aside id="filePanel">
+  <h2>Arborescence</h2>
+      <div class="row">
+        <label>Tâches parallèles
+          <input id="concurrency" type="number" value="3" min="1" step="1" />
+        </label>
+        <label>
+          <input id="autoConc" type="checkbox" /> Auto
+        </label>
+        <label>Min
+          <input id="minConc" type="number" value="1" min="1" step="1" />
+        </label>
+        <label>Max
+          <input id="maxConc" type="number" value="6" min="1" step="1" />
+        </label>
+      </div>
+  <div id="tree"></div>
+    </aside>
+  </div>
+</body>
+</html>

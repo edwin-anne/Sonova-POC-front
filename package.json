@@ -1,0 +1,13 @@
+{
+  "name": "sonova-poc-front",
+  "version": "1.0.0",
+  "description": "Node server delivering the upload test interface",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs"
+}
