@@ -5,6 +5,19 @@ const url = require('url');
 
 const PORT = process.env.PORT || 3000;
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+const NODE_MODULES_DIR = path.join(__dirname, '..', 'node_modules');
+
+const VENDOR_MOUNTS = [
+  {
+    prefix: '/vendor/libsodium/',
+    root: path.join(NODE_MODULES_DIR, 'libsodium-wrappers', 'dist', 'browsers'),
+  },
+  {
+    prefix: '/vendor/libsodium-esm/',
+    root: path.join(NODE_MODULES_DIR, 'libsodium-wrappers', 'dist', 'modules'),
+  },
+];
+
 
 const MIME_TYPES = {
   '.html': 'text/html; charset=UTF-8',
@@ -17,7 +30,8 @@ const MIME_TYPES = {
   '.gif': 'image/gif',
   '.svg': 'image/svg+xml; charset=UTF-8',
   '.ico': 'image/x-icon',
-  '.txt': 'text/plain; charset=UTF-8'
+  '.txt': 'text/plain; charset=UTF-8',
+  '.wasm': 'application/wasm',
 };
 
 function sendNotFound(res) {
@@ -35,6 +49,21 @@ const server = http.createServer((req, res) => {
   try {
     const parsedUrl = url.parse(req.url);
     const decodedPath = decodeURI(parsedUrl.pathname || '/');
+    const vendorMount = VENDOR_MOUNTS.find((mount) => decodedPath.startsWith(mount.prefix));
+    if (vendorMount) {
+      const relativeVendorPath = decodedPath.slice(vendorMount.prefix.length);
+      const safeVendorPath = path.normalize(relativeVendorPath).replace(/^\.\/+/, '');
+      const absoluteVendorPath = path.join(vendorMount.root, safeVendorPath);
+
+      if (!absoluteVendorPath.startsWith(vendorMount.root)) {
+        res.writeHead(403, { 'Content-Type': 'text/plain; charset=UTF-8' });
+        res.end('Forbidden');
+        return;
+      }
+
+      return serveVendorFile(absoluteVendorPath, res);
+    }
+
     let relativePath = decodedPath;
 
     if (relativePath.endsWith('/')) {
@@ -88,6 +117,15 @@ function serveFile(filePath, res) {
 
   stream.on('error', (error) => {
     sendServerError(res, error);
+  });
+}
+
+function serveVendorFile(filePath, res) {
+  fs.stat(filePath, (statErr, stats) => {
+    if (statErr || !stats.isFile()) {
+      return sendNotFound(res);
+    }
+    serveFile(filePath, res);
   });
 }
 

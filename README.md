@@ -4,7 +4,11 @@ Ce projet Node.js fournit une version autonome de la page de test d'upload de do
 
 ## Installation
 
-Aucune dépendance n'est nécessaire. Il suffit de cloner le dépôt.
+Installez les dépendances Node (libsodium est servi localement par le serveur HTTP).
+
+```bash
+npm install
+```
 
 ## Démarrage
 
@@ -22,4 +26,4 @@ Le serveur HTTP intégré démarre sur `http://localhost:3000` (modifiable via l
 - Comparaison de l'arborescence locale vs distante avec calcul de hash SHA-256 côté navigateur.
 - Logs détaillés et visualisation de la progression des fichiers.
 
-Le serveur Node sert simplement les fichiers statiques présents dans `public/`.
+Le serveur Node sert simplement les fichiers statiques présents dans `public/` ainsi que les ressources `libsodium-wrappers` exposées sous `/vendor/libsodium*`.
